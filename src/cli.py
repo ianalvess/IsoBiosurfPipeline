@@ -5,6 +5,8 @@ Currently implements:
   2. Docker daemon check;
   3. QC step (fastp), run as a container. Paired-end only.
   4. assembly step (SPAdes --isolate), run as a container.
+  5. QUAST: assembly quality metrics (N50, contig count, etc.).
+  6. CheckM2: completeness/contamination estimate for the assembled genome.
 """
 
 import sys
@@ -18,6 +20,8 @@ from loguru import logger
 DOCKER_IMAGES = {
     "qc": "isolados-biosurf/fastp",
     "assembly": "isolados-biosurf/spades",
+    "quast": "isolados-biosurf/quast",
+    "checkm2": "isolados-biosurf/checkm2",
 }
 
 
@@ -142,6 +146,97 @@ def run_assembly(
     return contigs
 
 
+def run_quast(
+    client: docker.DockerClient,
+    sample_id: str,
+    contigs: Path,
+    output_dir: Path,
+) -> None:
+    image = DOCKER_IMAGES["quast"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    contigs_rel = contigs.relative_to(output_dir).as_posix()
+
+    container_cmd = [
+        f"/output/{contigs_rel}",
+        "-o", "/output/quast",
+        "--threads", "4",
+    ]
+
+    logger.info(f"Running QUAST with image '{image}' for sample '{sample_id}'...")
+
+    volumes = {
+        to_docker_path(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+    }
+
+    logs = client.containers.run(
+        image,
+        command=container_cmd,
+        volumes=volumes,
+        remove=True,
+        stdout=True,
+        stderr=True,
+    )
+    logger.info(logs.decode("utf-8", errors="replace"))
+    logger.success(f"QUAST finished. Report in {output_dir / 'quast'}")
+
+
+def run_checkm2(
+    client: docker.DockerClient,
+    sample_id: str,
+    contigs: Path,
+    output_dir: Path,
+    db_path: Path,
+) -> None:
+    image = DOCKER_IMAGES["checkm2"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # CheckM2 expects a directory of genome fasta files, not a single file
+    # path. For an isolate, that directory just contains the one assembly.
+    genome_dir = output_dir / "checkm2_input"
+    genome_dir.mkdir(parents=True, exist_ok=True)
+    genome_link = genome_dir / "contigs.fasta"
+    if not genome_link.exists():
+        genome_link.write_bytes(contigs.read_bytes())
+
+    container_cmd = [
+        "predict",
+        "--input", "/input",
+        "--output-directory", "/output/checkm2",
+        "--database_path", "/db/CheckM2_database/uniref100.KO.1.dmnd",
+        "-x", "fasta",
+        "--force",
+        "-t", "4",
+    ]
+
+    logger.info(f"Running CheckM2 with image '{image}' for sample '{sample_id}'...")
+
+    volumes = {
+        to_docker_path(genome_dir.resolve()): {"bind": "/input", "mode": "ro"},
+        to_docker_path(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+        to_docker_path(db_path.resolve()): {"bind": "/db", "mode": "ro"},
+    }
+
+    container = client.containers.run(
+        image,
+        command=container_cmd,
+        volumes=volumes,
+        detach=True,
+    )
+    try:
+        for line in container.logs(stream=True):
+            print(line.decode("utf-8", errors="replace"), end="")
+        exit_code = container.wait()["StatusCode"]
+    finally:
+        container.remove()
+
+    if exit_code != 0:
+        logger.error(f"CheckM2 failed for sample '{sample_id}' (exit code {exit_code})")
+        sys.exit(1)
+
+    logger.success(f"CheckM2 finished. Report in {output_dir / 'checkm2'}")
+
+
 @click.command()
 @click.option(
     "--sample-id",
@@ -178,7 +273,18 @@ def main(sample_id: str, config_path: Path) -> None:
     output_dir = project_root / "results" / sample_id
 
     clean_reads = run_qc(client, sample_id, r1, r2, output_dir / "qc")
-    run_assembly(client, sample_id, clean_reads, output_dir)
+    contigs = run_assembly(client, sample_id, clean_reads, output_dir)
+    run_quast(client, sample_id, contigs, output_dir)
+
+    checkm2_db = project_root / "data" / "checkm2_db"
+    if not (checkm2_db / "CheckM2_database" / "uniref100.KO.1.dmnd").exists():
+        logger.error(
+            f"CheckM2 database not found at {checkm2_db}. "
+            f"Run 'checkm2 database --download --path {checkm2_db}' first "
+            f"(via the isolados-biosurf/checkm2 image)."
+        )
+        sys.exit(1)
+    run_checkm2(client, sample_id, contigs, output_dir, checkm2_db)
 
 
 if __name__ == "__main__":
