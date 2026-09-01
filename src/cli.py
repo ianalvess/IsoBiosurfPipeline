@@ -7,6 +7,9 @@ Currently implements:
   4. assembly step (SPAdes --isolate), run as a container.
   5. QUAST: assembly quality metrics (N50, contig count, etc.).
   6. CheckM2: completeness/contamination estimate for the assembled genome.
+  7. BioSurfDB search: Prodigal gene prediction on the assembled genome +
+     DIAMOND search against a local BioSurfDB database, summarized by
+     biosurfactant pathway category (top-20 table + bar chart).
 """
 
 import sys
@@ -22,6 +25,7 @@ DOCKER_IMAGES = {
     "assembly": "isolados-biosurf/spades",
     "quast": "isolados-biosurf/quast",
     "checkm2": "isolados-biosurf/checkm2",
+    "biosurfdb": "isolados-biosurf/biosurfdb",
 }
 
 
@@ -237,6 +241,136 @@ def run_checkm2(
     logger.success(f"CheckM2 finished. Report in {output_dir / 'checkm2'}")
 
 
+def run_biosurfdb_search(
+    client: docker.DockerClient,
+    sample_id: str,
+    contigs: Path,
+    output_dir: Path,
+    db_path: Path,
+) -> None:
+    """Predict genes on the assembled genome (Prodigal) and search them
+    against the local BioSurfDB DIAMOND database.
+    """
+    image = DOCKER_IMAGES["biosurfdb"]
+    biosurfdb_dir = output_dir / "biosurfdb"
+    biosurfdb_dir.mkdir(parents=True, exist_ok=True)
+
+    contigs_rel = contigs.relative_to(output_dir).as_posix()
+
+    script = (
+        "set -e && "
+        f"prodigal -i /output/{contigs_rel} -a /output/biosurfdb/{sample_id}.faa -p single -q && "
+        f"diamond blastp "
+        f"  -q /output/biosurfdb/{sample_id}.faa "
+        f"  -d /db/biosurfdb.dmnd "
+        f"  -o /output/biosurfdb/{sample_id}_hits.tsv "
+        f"  --outfmt 6 qseqid sseqid pident length evalue bitscore stitle "
+        f"  --evalue 1e-5 --max-target-seqs 1 --threads 4"
+    )
+
+    logger.info(f"Running BioSurfDB gene prediction + DIAMOND search with image '{image}' for sample '{sample_id}'...")
+
+    volumes = {
+        to_docker_path(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
+        to_docker_path(db_path.resolve()): {"bind": "/db", "mode": "ro"},
+    }
+
+    container = client.containers.run(
+        image,
+        command=["-c", script],
+        volumes=volumes,
+        detach=True,
+    )
+    try:
+        for line in container.logs(stream=True):
+            print(line.decode("utf-8", errors="replace"), end="")
+        exit_code = container.wait()["StatusCode"]
+    finally:
+        container.remove()
+
+    if exit_code != 0:
+        logger.error(f"BioSurfDB search failed for sample '{sample_id}' (exit code {exit_code})")
+        sys.exit(1)
+
+    logger.success(f"BioSurfDB search finished. Hits in {biosurfdb_dir / f'{sample_id}_hits.tsv'}")
+
+
+def generate_biosurfdb_report(sample_id: str, output_dir: Path, db_path: Path) -> None:
+    """Map DIAMOND hits to BioSurfDB functional categories and produce a
+    top-20 table plus a bar chart, at the whole-genome level (isolate =
+    single genome, no per-bin breakdown needed).
+    """
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    hits_path = output_dir / "biosurfdb" / f"{sample_id}_hits.tsv"
+    report_dir = output_dir / "biosurfdb" / "report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    if not hits_path.exists() or hits_path.stat().st_size == 0:
+        logger.warning(f"No BioSurfDB hits found at {hits_path} — skipping report.")
+        return
+
+    acc2id: dict[str, str] = {}
+    with open(db_path / "acc2biosurfdb.map", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 2:
+                acc2id[parts[0]] = parts[1]
+
+    id2name: dict[str, str] = {}
+    with open(db_path / "biosurfdb.map", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 2:
+                id2name[parts[0]] = parts[1]
+
+    df = pd.read_csv(
+        hits_path,
+        sep="\t",
+        header=None,
+        names=["qseqid", "sseqid", "pident", "length", "evalue", "bitscore", "stitle"],
+    )
+    df["category_id"] = df["sseqid"].map(acc2id).fillna("")
+    df["category_name"] = df["category_id"].map(id2name).fillna("unknown")
+
+    total_hits = len(df)
+    counts = df.groupby("category_name").size().sort_values(ascending=False)
+    top20 = counts.head(20)
+    top20_pct = (top20 / total_hits * 100).round(2)
+
+    table = top20.reset_index(name="hit_count")
+    table["percentage_of_total_hits"] = top20_pct.values
+    table_path = report_dir / "top20_categories.csv"
+    table.to_csv(table_path, index=False)
+    logger.success(f"Top-20 category table written to {table_path}")
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    ax.barh(
+        top20_pct.index[::-1],
+        top20_pct.values[::-1],
+        color="#4575b4",
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    ax.set_xlabel("Percentage of total hits (%)", fontsize=11)
+    ax.set_ylabel("")
+    ax.set_title(
+        f"BioSurfDB Functional Categories — Sample {sample_id}\n"
+        "Top 20 categories",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+
+    chart_path = report_dir / "top20_categories.png"
+    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Chart written to {chart_path}")
+
+
 @click.command()
 @click.option(
     "--sample-id",
@@ -285,6 +419,16 @@ def main(sample_id: str, config_path: Path) -> None:
         )
         sys.exit(1)
     run_checkm2(client, sample_id, contigs, output_dir, checkm2_db)
+
+    biosurfdb_db = project_root / "data" / "biosurfdb"
+    if not (biosurfdb_db / "biosurfdb.dmnd").exists():
+        logger.error(
+            f"BioSurfDB database not found at {biosurfdb_db}. "
+            f"Place biosurfdb.dmnd, acc2biosurfdb.map and biosurfdb.map there first."
+        )
+        sys.exit(1)
+    run_biosurfdb_search(client, sample_id, contigs, output_dir, biosurfdb_db)
+    generate_biosurfdb_report(sample_id, output_dir, biosurfdb_db)
 
 
 if __name__ == "__main__":
