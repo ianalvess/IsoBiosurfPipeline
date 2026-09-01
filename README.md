@@ -1,5 +1,4 @@
-# isolados-biosurf
-
+# IsoBiosurfPipeline 
 Automated, containerized pipeline for the genomic characterization of bacterial and archaeal isolates, with a focus on identifying biosurfactant-related functional genes via [BioSurfDB](http://www.biosurfdb.org/).
 
 Sibling project to [metagen-biosurf](https://github.com/ianalvess/metagen-biosurf), adapted from metagenomic community analysis to single-organism isolate genomes.
