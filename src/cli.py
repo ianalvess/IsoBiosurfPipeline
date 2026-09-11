@@ -59,25 +59,36 @@ def run_qc(
     client: docker.DockerClient,
     sample_id: str,
     r1: Path,
-    r2: Path,
+    r2: Path | None,
     output_dir: Path,
 ) -> dict:
     image = DOCKER_IMAGES["qc"]
     output_dir.mkdir(parents=True, exist_ok=True)
+    paired = r2 is not None
 
     clean_r1_name = f"{sample_id}_R1.clean.fastq.gz"
-    clean_r2_name = f"{sample_id}_R2.clean.fastq.gz"
 
     container_cmd = [
         "-i", f"/input/{r1.name}",
-        "-I", f"/input/{r2.name}",
         "-o", f"/output/{clean_r1_name}",
-        "-O", f"/output/{clean_r2_name}",
         "-j", "/output/fastp.json",
         "-h", "/output/fastp.html",
     ]
 
-    logger.info(f"Running QC step (fastp) with image '{image}' for sample '{sample_id}'...")
+    clean_reads = {"r1": output_dir / clean_r1_name}
+
+    if paired:
+        clean_r2_name = f"{sample_id}_R2.clean.fastq.gz"
+        container_cmd += [
+            "-I", f"/input/{r2.name}",
+            "-O", f"/output/{clean_r2_name}",
+        ]
+        clean_reads["r2"] = output_dir / clean_r2_name
+
+    logger.info(
+        f"Running QC step (fastp) with image '{image}' for sample '{sample_id}' "
+        f"({'paired-end' if paired else 'single-end'})..."
+    )
 
     volumes = {
         to_docker_path(r1.parent.resolve()): {"bind": "/input", "mode": "ro"},
@@ -95,10 +106,7 @@ def run_qc(
     logger.info(logs.decode("utf-8", errors="replace"))
     logger.success(f"QC step finished. Output in {output_dir}")
 
-    return {
-        "r1": output_dir / clean_r1_name,
-        "r2": output_dir / clean_r2_name,
-    }
+    return clean_reads
 
 
 def run_assembly(
@@ -110,18 +118,30 @@ def run_assembly(
     image = DOCKER_IMAGES["assembly"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    paired = "r2" in clean_reads
     r1_rel = clean_reads["r1"].relative_to(output_dir).as_posix()
-    r2_rel = clean_reads["r2"].relative_to(output_dir).as_posix()
 
-    container_cmd = [
-        "--isolate",
-        "-1", f"/output/{r1_rel}",
-        "-2", f"/output/{r2_rel}",
-        "-o", "/output/assembly",
-        "--threads", "4",
-    ]
+    if paired:
+        r2_rel = clean_reads["r2"].relative_to(output_dir).as_posix()
+        container_cmd = [
+            "--isolate",
+            "-1", f"/output/{r1_rel}",
+            "-2", f"/output/{r2_rel}",
+            "-o", "/output/assembly",
+            "--threads", "4",
+        ]
+    else:
+        container_cmd = [
+            "--isolate",
+            "-s", f"/output/{r1_rel}",
+            "-o", "/output/assembly",
+            "--threads", "4",
+        ]
 
-    logger.info(f"Running assembly step (SPAdes --isolate) with image '{image}' for sample '{sample_id}'...")
+    logger.info(
+        f"Running assembly step (SPAdes --isolate) with image '{image}' for sample '{sample_id}' "
+        f"({'paired-end' if paired else 'single-end'})..."
+    )
 
     volumes = {
         to_docker_path(output_dir.resolve()): {"bind": "/output", "mode": "rw"},
@@ -395,7 +415,7 @@ def main(sample_id: str, config_path: Path) -> None:
         sys.exit(1)
 
     r1 = project_root / samples[sample_id]["r1"]
-    r2 = project_root / samples[sample_id]["r2"]
+    r2 = project_root / samples[sample_id]["r2"] if samples[sample_id].get("r2") else None
     logger.info(f"Sample: {sample_id}")
 
     logger.info("Checking Docker access...")
