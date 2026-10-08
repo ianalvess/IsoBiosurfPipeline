@@ -102,8 +102,8 @@ results/<sample_id>/
 └── biosurfdb/
     ├── <sample_id>_hits.tsv # raw DIAMOND hits
     └── report/
-        ├── top20_categories.csv
-        └── top20_categories.png
+        ├── classes_summary.csv
+        └── classes_summary.png
 ```
 
 ## Project structure
