@@ -1,4 +1,5 @@
-# IsoBiosurfPipeline 
+# isolados-biosurf
+
 Automated, containerized pipeline for the genomic characterization of bacterial and archaeal isolates, with a focus on identifying biosurfactant-related functional genes via [BioSurfDB](http://www.biosurfdb.org/).
 
 Sibling project to [metagen-biosurf](https://github.com/ianalvess/metagen-biosurf), adapted from metagenomic community analysis to single-organism isolate genomes.
@@ -60,7 +61,7 @@ CheckM2 (~3.5GB):
 docker run --rm -v <absolute-path-to>/data/checkm2_db:/db isolados-biosurf/checkm2 database --download --path /db
 ```
 
-BioSurfDB: place `biosurfdb.dmnd`, `acc2biosurfdb.map`, and `biosurfdb.map` in `data/biosurfdb/`.
+BioSurfDB: place `biosurfdb.dmnd`, `acc2biosurfdb.map`, `biosurfdb.map`, and `biosurfdb.tre` (the category hierarchy) in `data/biosurfdb/`.
 
 **3. Install Python dependencies:**
 
@@ -79,7 +80,7 @@ samples:
     r2: "data/M11/M11_R2.fq.gz"
 ```
 
-Reads must be placed inside the project's `data/` directory.
+Reads must be placed inside the project's `data/` directory — paths outside the project (e.g. on the Desktop) can cause Docker bind mount failures on Windows.
 
 ## Usage
 
@@ -87,7 +88,15 @@ Reads must be placed inside the project's `data/` directory.
 python src/cli.py --sample-id M11
 ```
 
-Runs the full pipeline end to end for the specified sample.
+Runs the full pipeline end to end for the specified sample. Missing databases are reported before any step runs.
+
+To build only the BioSurfDB report from an existing DIAMOND hits table (e.g. an already-assembled fosmid or plasmid sequence searched outside the pipeline):
+
+```bash
+python src/cli.py --sample-id AvH --hits data/AvH/AvH_hits.tsv
+```
+
+The report is written to `results/AvH/biosurfdb/report/`. Hits outside the surfactant biosynthesis branch of the BioSurfDB hierarchy are excluded from the summary tables and charts, and percentages are normalized to the remaining hits; `hits_annotated.csv` keeps every hit.
 
 ## Output
 
@@ -102,8 +111,10 @@ results/<sample_id>/
 └── biosurfdb/
     ├── <sample_id>_hits.tsv # raw DIAMOND hits
     └── report/
-        ├── classes_summary.csv
-        └── classes_summary.png
+        ├── categories_summary.csv / .png   # specific categories
+        ├── subclasses_summary.csv / .png   # e.g. Putisolvins Biosynthesis
+        ├── classes_summary.csv / .png      # e.g. Lipopeptides Biosynthesis
+        └── hits_annotated.csv              # every hit, with all hierarchy levels
 ```
 
 ## Project structure
