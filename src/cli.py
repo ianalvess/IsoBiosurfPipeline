@@ -8,8 +8,10 @@ Currently implements:
   5. QUAST: assembly quality metrics (N50, contig count, etc.).
   6. CheckM2: completeness/contamination estimate for the assembled genome.
   7. BioSurfDB search: Prodigal gene prediction on the assembled genome +
-     DIAMOND search against a local BioSurfDB database, summarized by
-     biosurfactant pathway category (top-20 table + bar chart).
+     DIAMOND search against a local BioSurfDB database, summarized at three
+     levels of the BioSurfDB hierarchy (categories, subclasses, broad
+     classes) as CSV tables and bar charts. With --hits, only this report
+     is generated from an existing hits TSV.
 """
 
 import sys
@@ -315,35 +317,131 @@ def run_biosurfdb_search(
     logger.success(f"BioSurfDB search finished. Hits in {biosurfdb_dir / f'{sample_id}_hits.tsv'}")
 
 
-def generate_biosurfdb_report(sample_id: str, output_dir: Path, db_path: Path) -> None:
-    """Map DIAMOND hits to BioSurfDB functional categories and produce a
-    top-20 table plus a bar chart, at the whole-genome level (isolate =
-    single genome, no per-bin breakdown needed).
+UNCLASSIFIED = "unclassified / outside surfactant biosynthesis"
+BIOSURFDB_FILES = ("biosurfdb.dmnd", "acc2biosurfdb.map", "biosurfdb.map", "biosurfdb.tre")
+REPORT_DB_FILES = ("acc2biosurfdb.map", "biosurfdb.map", "biosurfdb.tre")
+
+
+def missing_biosurfdb_files(db_path: Path, names: tuple[str, ...] = BIOSURFDB_FILES) -> list[str]:
+    """Return the names of required BioSurfDB files missing from db_path."""
+    return [name for name in names if not (db_path / name).exists()]
+
+
+def load_two_column_map(path: Path) -> dict[str, str]:
+    """Load a tab-separated two-column map file into a dict."""
+    mapping: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 2:
+                mapping[parts[0]] = parts[1]
+    return mapping
+
+
+def parse_newick(text: str) -> dict[str, str]:
+    """Parse a simple Newick tree (no branch lengths, numeric labels only)
+    into a {child_id: parent_id} map covering every labelled node.
     """
-    import pandas as pd
+    s = text.strip()
+    if s.endswith(";"):
+        s = s[:-1]
+
+    pos = [0]
+    parent: dict[str, str] = {}
+
+    def parse_name() -> str:
+        start = pos[0]
+        while pos[0] < len(s) and s[pos[0]] not in ",()":
+            pos[0] += 1
+        return s[start:pos[0]]
+
+    def parse_clade() -> str:
+        if s[pos[0]] == "(":
+            pos[0] += 1
+            children = []
+            while True:
+                children.append(parse_clade())
+                if s[pos[0]] == ",":
+                    pos[0] += 1
+                elif s[pos[0]] == ")":
+                    pos[0] += 1
+                    break
+            name = parse_name()
+            for child in children:
+                parent[child] = name
+            return name
+        return parse_name()
+
+    parse_clade()
+    return parent
+
+
+def ancestor_chain(node_id: str, parent: dict[str, str], root_id: str) -> list[str] | None:
+    """Return the path [node, ..., class] from node_id up to the direct child
+    of root_id (the broad class), or None if node_id is not under root_id.
+    """
+    chain = [node_id]
+    current = node_id
+    while current in parent:
+        p = parent[current]
+        if p == root_id:
+            return chain
+        chain.append(p)
+        current = p
+    return None
+
+
+def barh_chart(series, title: str, xlabel: str, path: Path, width: float = 9) -> None:
+    """Save a horizontal bar chart from a pandas Series (largest value on top)."""
     import matplotlib.pyplot as plt
 
-    hits_path = output_dir / "biosurfdb" / f"{sample_id}_hits.tsv"
-    report_dir = output_dir / "biosurfdb" / "report"
-    report_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(width, max(4, 0.4 * len(series))))
+    ax.barh(
+        series.index[::-1],
+        series.values[::-1],
+        color="#4575b4",
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel("")
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.success(f"Chart written to {path}")
+
+
+def generate_biosurfdb_report(
+    sample_id: str,
+    hits_path: Path,
+    db_path: Path,
+    report_dir: Path,
+    root_id: str = "2",
+) -> None:
+    """Build BioSurfDB reports from a DIAMOND hits TSV (outfmt 6: qseqid sseqid
+    pident length evalue bitscore stitle) at three levels of the hierarchy:
+    specific categories, subclasses (directly below each broad class) and
+    broad classes (direct children of root_id in biosurfdb.tre; default 2,
+    "Surfactants"). Each level gets a full CSV table and a bar chart.
+
+    Hits outside root_id are excluded from the summaries, which are
+    normalized to the remaining (classified) hits; hits_annotated.csv keeps
+    every hit. Pure Python — runs on the host, no container needed.
+    """
+    import pandas as pd
 
     if not hits_path.exists() or hits_path.stat().st_size == 0:
         logger.warning(f"No BioSurfDB hits found at {hits_path} — skipping report.")
         return
 
-    acc2id: dict[str, str] = {}
-    with open(db_path / "acc2biosurfdb.map", "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) == 2:
-                acc2id[parts[0]] = parts[1]
+    report_dir.mkdir(parents=True, exist_ok=True)
 
-    id2name: dict[str, str] = {}
-    with open(db_path / "biosurfdb.map", "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) == 2:
-                id2name[parts[0]] = parts[1]
+    acc2id = load_two_column_map(db_path / "acc2biosurfdb.map")
+    id2name = load_two_column_map(db_path / "biosurfdb.map")
+    parent_map = parse_newick((db_path / "biosurfdb.tre").read_text(encoding="utf-8", errors="replace"))
 
     df = pd.read_csv(
         hits_path,
@@ -354,58 +452,136 @@ def generate_biosurfdb_report(sample_id: str, output_dir: Path, db_path: Path) -
     df["category_id"] = df["sseqid"].map(acc2id).fillna("")
     df["category_name"] = df["category_id"].map(id2name).fillna("unknown")
 
-    total_hits = len(df)
-    counts = df.groupby("category_name").size().sort_values(ascending=False)
-    top20 = counts.head(20)
-    top20_pct = (top20 / total_hits * 100).round(2)
+    def levels_for(category_id: str) -> tuple[str, str]:
+        """Return (class_id, subclass_id), or ("", "") if the category is not
+        under the root node. A category directly under a class is its own
+        subclass.
+        """
+        chain = ancestor_chain(category_id, parent_map, root_id)
+        if chain is None:
+            return "", ""
+        return chain[-1], chain[-2] if len(chain) >= 2 else chain[-1]
 
-    table = top20.reset_index(name="hit_count")
-    table["percentage_of_total_hits"] = top20_pct.values
-    table_path = report_dir / "top20_categories.csv"
-    table.to_csv(table_path, index=False)
-    logger.success(f"Top-20 category table written to {table_path}")
+    def name_of(node_id: str) -> str:
+        if node_id == "":
+            return UNCLASSIFIED
+        return id2name.get(node_id, f"unknown (id {node_id})")
 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    ax.barh(
-        top20_pct.index[::-1],
-        top20_pct.values[::-1],
-        color="#4575b4",
-        edgecolor="white",
-        linewidth=0.5,
+    pairs = [levels_for(cid) for cid in df["category_id"]]
+    df["class_id"] = [p[0] for p in pairs]
+    df["subclass_id"] = [p[1] for p in pairs]
+    df["class_name"] = df["class_id"].apply(name_of)
+    df["subclass_name"] = df["subclass_id"].apply(name_of)
+
+    # Per-hit annotated table (all hits, all hierarchy levels)
+    annotated_path = report_dir / "hits_annotated.csv"
+    df.to_csv(annotated_path, index=False)
+    logger.success(f"Annotated hits written to {annotated_path}")
+
+    # Summaries exclude hits outside the root node and are normalized to
+    # the remaining (classified) hits.
+    df_cls = df[df["class_id"] != ""]
+    total_hits = len(df_cls)
+    logger.info(f"Excluded {len(df) - total_hits} unclassified hits; {total_hits} hits used for the summaries.")
+    if total_hits == 0:
+        logger.warning("No classified hits left; skipping summaries.")
+        return
+
+    # Level 1: specific categories (all)
+    cat_counts = df_cls.groupby("category_name").size().sort_values(ascending=False)
+    cat_pct = (cat_counts / total_hits * 100).round(2)
+    cat_table = cat_counts.reset_index(name="hit_count")
+    cat_table["percentage_of_classified_hits"] = cat_pct.values
+    cat_table_path = report_dir / "categories_summary.csv"
+    cat_table.to_csv(cat_table_path, index=False)
+    logger.success(f"Category table written to {cat_table_path}")
+    barh_chart(
+        cat_pct,
+        f"BioSurfDB Functional Categories — Sample {sample_id}",
+        "Percentage of classified hits (%)",
+        report_dir / "categories_summary.png",
     )
-    ax.set_xlabel("Percentage of total hits (%)", fontsize=11)
-    ax.set_ylabel("")
-    ax.set_title(
-        f"BioSurfDB Functional Categories — Sample {sample_id}\n"
-        "Top 20 categories",
-        fontsize=13,
-        fontweight="bold",
-    )
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    fig.tight_layout()
 
-    chart_path = report_dir / "top20_categories.png"
-    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    logger.success(f"Chart written to {chart_path}")
+    # Level 2: subclasses (all, with their parent class)
+    sub_table = (
+        df_cls.groupby(["class_name", "subclass_name"])
+        .size()
+        .sort_values(ascending=False)
+        .reset_index(name="hit_count")
+    )
+    sub_table["percentage_of_classified_hits"] = (sub_table["hit_count"] / total_hits * 100).round(2)
+    sub_table_path = report_dir / "subclasses_summary.csv"
+    sub_table.to_csv(sub_table_path, index=False)
+    logger.success(f"Subclass table written to {sub_table_path}")
+    sub_labels = (sub_table["subclass_name"] + "  (" + sub_table["class_name"] + ")").tolist()
+    barh_chart(
+        pd.Series(sub_table["percentage_of_classified_hits"].values, index=sub_labels),
+        f"BioSurfDB Subclasses — Sample {sample_id}",
+        "Percentage of classified hits (%)",
+        report_dir / "subclasses_summary.png",
+        width=11,
+    )
+
+    # Level 3: broad classes (all)
+    class_counts = df_cls.groupby("class_name").size().sort_values(ascending=False)
+    class_pct = (class_counts / total_hits * 100).round(2)
+    class_table = class_counts.reset_index(name="hit_count")
+    class_table["percentage_of_classified_hits"] = class_pct.values
+    class_table_path = report_dir / "classes_summary.csv"
+    class_table.to_csv(class_table_path, index=False)
+    logger.success(f"Class-level table written to {class_table_path}")
+    barh_chart(
+        class_pct,
+        f"BioSurfDB Broad Classes — Sample {sample_id}",
+        "Percentage of classified hits (%)",
+        report_dir / "classes_summary.png",
+    )
 
 
 @click.command()
 @click.option(
     "--sample-id",
     required=True,
-    help="Sample identifier, as defined in config/samples.yaml.",
+    help="Sample identifier (defined in config/samples.yaml, unless --hits is used).",
 )
 @click.option(
     "--config",
     "config_path",
     default=Path(__file__).resolve().parent.parent / "config" / "samples.yaml",
-    type=click.Path(exists=True, path_type=Path),
+    type=click.Path(path_type=Path),
     help="Path to the samples YAML configuration file.",
 )
-def main(sample_id: str, config_path: Path) -> None:
+@click.option(
+    "--hits",
+    "hits_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "Skip the pipeline and only build the BioSurfDB report from an existing "
+        "DIAMOND hits TSV (e.g. a fosmid/plasmid assembly searched outside the "
+        "pipeline). Output goes to results/<sample-id>/biosurfdb/report."
+    ),
+)
+def main(sample_id: str, config_path: Path, hits_path: Path | None) -> None:
     project_root = Path(__file__).resolve().parent.parent
+    biosurfdb_db = project_root / "data" / "biosurfdb"
+    checkm2_db = project_root / "data" / "checkm2_db"
+    output_dir = project_root / "results" / sample_id
+
+    # Report-only mode: no config lookup, no Docker
+    if hits_path is not None:
+        missing = missing_biosurfdb_files(biosurfdb_db, REPORT_DB_FILES)
+        if missing:
+            logger.error(f"Missing BioSurfDB files in {biosurfdb_db}: {', '.join(missing)}")
+            sys.exit(1)
+        generate_biosurfdb_report(
+            sample_id, hits_path, biosurfdb_db, output_dir / "biosurfdb" / "report"
+        )
+        return
+
+    if not config_path.exists():
+        logger.error(f"Configuration file not found: {config_path}")
+        sys.exit(1)
 
     logger.info(f"Loading configuration from: {config_path}")
     samples = load_samples(config_path)
@@ -418,37 +594,36 @@ def main(sample_id: str, config_path: Path) -> None:
     r2 = project_root / samples[sample_id]["r2"] if samples[sample_id].get("r2") else None
     logger.info(f"Sample: {sample_id}")
 
+    # Fail early if a required database is missing, before any long step runs
+    if not (checkm2_db / "CheckM2_database" / "uniref100.KO.1.dmnd").exists():
+        logger.error(
+            f"CheckM2 database not found at {checkm2_db}. "
+            f"Download it first with the isolados-biosurf/checkm2 image "
+            f"('checkm2 database --download --path /db')."
+        )
+        sys.exit(1)
+    missing = missing_biosurfdb_files(biosurfdb_db)
+    if missing:
+        logger.error(f"Missing BioSurfDB files in {biosurfdb_db}: {', '.join(missing)}")
+        sys.exit(1)
+
     logger.info("Checking Docker access...")
     client = check_docker()
     if client is None:
         sys.exit(1)
     logger.success("Docker is reachable.")
 
-    output_dir = project_root / "results" / sample_id
-
     clean_reads = run_qc(client, sample_id, r1, r2, output_dir / "qc")
     contigs = run_assembly(client, sample_id, clean_reads, output_dir)
     run_quast(client, sample_id, contigs, output_dir)
-
-    checkm2_db = project_root / "data" / "checkm2_db"
-    if not (checkm2_db / "CheckM2_database" / "uniref100.KO.1.dmnd").exists():
-        logger.error(
-            f"CheckM2 database not found at {checkm2_db}. "
-            f"Run 'checkm2 database --download --path {checkm2_db}' first "
-            f"(via the isolados-biosurf/checkm2 image)."
-        )
-        sys.exit(1)
     run_checkm2(client, sample_id, contigs, output_dir, checkm2_db)
-
-    biosurfdb_db = project_root / "data" / "biosurfdb"
-    if not (biosurfdb_db / "biosurfdb.dmnd").exists():
-        logger.error(
-            f"BioSurfDB database not found at {biosurfdb_db}. "
-            f"Place biosurfdb.dmnd, acc2biosurfdb.map and biosurfdb.map there first."
-        )
-        sys.exit(1)
     run_biosurfdb_search(client, sample_id, contigs, output_dir, biosurfdb_db)
-    generate_biosurfdb_report(sample_id, output_dir, biosurfdb_db)
+    generate_biosurfdb_report(
+        sample_id,
+        output_dir / "biosurfdb" / f"{sample_id}_hits.tsv",
+        biosurfdb_db,
+        output_dir / "biosurfdb" / "report",
+    )
 
 
 if __name__ == "__main__":
