@@ -10,10 +10,12 @@ Currently implements:
   7. BioSurfDB search: Prodigal gene prediction on the assembled genome +
      DIAMOND search against a local BioSurfDB database, summarized at three
      levels of the BioSurfDB hierarchy (categories, subclasses, broad
-     classes) as CSV tables and bar charts. With --hits, only this report
+     classes) as CSV tables and bar charts. Hits can be filtered by a
+     minimum percent identity (--min-pident). With --hits, only this report
      is generated from an existing hits TSV.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -338,6 +340,29 @@ def load_two_column_map(path: Path) -> dict[str, str]:
     return mapping
 
 
+def load_prodigal_coords(faa_path: Path) -> dict[str, tuple[int, int, int, str]]:
+    """Read gene coordinates from Prodigal protein FASTA headers, which look
+    like '>id # start # end # strand # ID=1_1;partial=00;...'. Keys are the
+    first header token, i.e. the query ID that DIAMOND reports.
+    """
+    coords: dict[str, tuple[int, int, int, str]] = {}
+    with open(faa_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.startswith(">"):
+                continue
+            parts = [part.strip() for part in line[1:].split(" # ")]
+            if len(parts) < 5:
+                continue
+            partial = re.search(r"partial=(\d\d)", parts[4])
+            coords[parts[0]] = (
+                int(parts[1]),
+                int(parts[2]),
+                int(parts[3]),
+                partial.group(1) if partial else "",
+            )
+    return coords
+
+
 def parse_newick(text: str) -> dict[str, str]:
     """Parse a simple Newick tree (no branch lengths, numeric labels only)
     into a {child_id: parent_id} map covering every labelled node.
@@ -420,6 +445,7 @@ def generate_biosurfdb_report(
     db_path: Path,
     report_dir: Path,
     root_id: str = "2",
+    min_pident: float = 0.0,
 ) -> None:
     """Build BioSurfDB reports from a DIAMOND hits TSV (outfmt 6: qseqid sseqid
     pident length evalue bitscore stitle) at three levels of the hierarchy:
@@ -427,9 +453,13 @@ def generate_biosurfdb_report(
     broad classes (direct children of root_id in biosurfdb.tre; default 2,
     "Surfactants"). Each level gets a full CSV table and a bar chart.
 
-    Hits outside root_id are excluded from the summaries, which are
-    normalized to the remaining (classified) hits; hits_annotated.csv keeps
-    every hit. Pure Python — runs on the host, no container needed.
+    Hits outside root_id, and hits below min_pident (percent identity; 0 =
+    no filter), are excluded from the summaries, which are normalized to the
+    remaining hits. hits_annotated.csv keeps every hit, flagged in
+    passes_min_pident, with genomic context derived from SPAdes/Prodigal
+    IDs (contig, contig length, contig coverage) and, when the Prodigal
+    protein FASTA (<name>.faa next to <name>_hits.tsv) is found, gene
+    coordinates. Pure Python — runs on the host, no container needed.
     """
     import pandas as pd
 
@@ -452,6 +482,30 @@ def generate_biosurfdb_report(
     df["category_id"] = df["sseqid"].map(acc2id).fillna("")
     df["category_name"] = df["category_id"].map(id2name).fillna("unknown")
 
+    # Genomic context from IDs like NODE_<n>_length_<L>_cov_<C>_<gene index>
+    # (SPAdes contig name + Prodigal gene index). Left empty for other ID styles.
+    id_parts = df["qseqid"].astype(str).str.rsplit("_", n=1)
+    df["contig"] = id_parts.str[0]
+    df["gene_index"] = id_parts.str[1]
+    contig_info = df["contig"].str.extract(r"_length_(\d+)_cov_([0-9.]+)$")
+    df["contig_length"] = pd.to_numeric(contig_info[0], errors="coerce")
+    df["contig_coverage"] = pd.to_numeric(contig_info[1], errors="coerce")
+
+    proteins_path = None
+    if hits_path.name.endswith("_hits.tsv"):
+        proteins_path = hits_path.with_name(hits_path.name[: -len("_hits.tsv")] + ".faa")
+    if proteins_path is not None and proteins_path.exists():
+        coords = pd.DataFrame.from_dict(
+            load_prodigal_coords(proteins_path),
+            orient="index",
+            columns=["gene_start", "gene_end", "gene_strand", "gene_partial"],
+        )
+        df = df.join(coords, on="qseqid")
+        for col in ("gene_start", "gene_end", "gene_strand"):
+            df[col] = df[col].astype("Int64")
+    else:
+        logger.info("Prodigal protein FASTA not found next to the hits file; gene coordinates omitted.")
+
     def levels_for(category_id: str) -> tuple[str, str]:
         """Return (class_id, subclass_id), or ("", "") if the category is not
         under the root node. A category directly under a class is its own
@@ -473,19 +527,28 @@ def generate_biosurfdb_report(
     df["class_name"] = df["class_id"].apply(name_of)
     df["subclass_name"] = df["subclass_id"].apply(name_of)
 
+    df["passes_min_pident"] = df["pident"] >= min_pident
+
     # Per-hit annotated table (all hits, all hierarchy levels)
     annotated_path = report_dir / "hits_annotated.csv"
     df.to_csv(annotated_path, index=False)
     logger.success(f"Annotated hits written to {annotated_path}")
 
-    # Summaries exclude hits outside the root node and are normalized to
-    # the remaining (classified) hits.
-    df_cls = df[df["class_id"] != ""]
+    # Summaries exclude hits outside the root node and hits below the
+    # identity cutoff, and are normalized to the remaining hits.
+    classified = df["class_id"] != ""
+    df_cls = df[classified & df["passes_min_pident"]]
     total_hits = len(df_cls)
-    logger.info(f"Excluded {len(df) - total_hits} unclassified hits; {total_hits} hits used for the summaries.")
+    n_unclassified = int((~classified).sum())
+    n_low_identity = int((classified & ~df["passes_min_pident"]).sum())
+    logger.info(
+        f"Excluded {n_unclassified} unclassified hits and {n_low_identity} classified hits "
+        f"below {min_pident:g}% identity; {total_hits} hits used for the summaries."
+    )
     if total_hits == 0:
-        logger.warning("No classified hits left; skipping summaries.")
+        logger.warning("No hits left for the summaries; skipping.")
         return
+    title_note = f"\n(identity \u2265 {min_pident:g}%)" if min_pident > 0 else ""
 
     # Level 1: specific categories (all)
     cat_counts = df_cls.groupby("category_name").size().sort_values(ascending=False)
@@ -497,7 +560,7 @@ def generate_biosurfdb_report(
     logger.success(f"Category table written to {cat_table_path}")
     barh_chart(
         cat_pct,
-        f"BioSurfDB Functional Categories — Sample {sample_id}",
+        f"BioSurfDB Functional Categories — Sample {sample_id}{title_note}",
         "Percentage of classified hits (%)",
         report_dir / "categories_summary.png",
     )
@@ -516,7 +579,7 @@ def generate_biosurfdb_report(
     sub_labels = (sub_table["subclass_name"] + "  (" + sub_table["class_name"] + ")").tolist()
     barh_chart(
         pd.Series(sub_table["percentage_of_classified_hits"].values, index=sub_labels),
-        f"BioSurfDB Subclasses — Sample {sample_id}",
+        f"BioSurfDB Subclasses — Sample {sample_id}{title_note}",
         "Percentage of classified hits (%)",
         report_dir / "subclasses_summary.png",
         width=11,
@@ -532,7 +595,7 @@ def generate_biosurfdb_report(
     logger.success(f"Class-level table written to {class_table_path}")
     barh_chart(
         class_pct,
-        f"BioSurfDB Broad Classes — Sample {sample_id}",
+        f"BioSurfDB Broad Classes — Sample {sample_id}{title_note}",
         "Percentage of classified hits (%)",
         report_dir / "classes_summary.png",
     )
@@ -562,7 +625,19 @@ def generate_biosurfdb_report(
         "pipeline). Output goes to results/<sample-id>/biosurfdb/report."
     ),
 )
-def main(sample_id: str, config_path: Path, hits_path: Path | None) -> None:
+@click.option(
+    "--min-pident",
+    "min_pident",
+    default=0.0,
+    show_default=True,
+    type=click.FloatRange(0, 100),
+    help=(
+        "Minimum DIAMOND percent identity for a hit to enter the summary tables "
+        "and charts (0 = no filter). hits_annotated.csv always keeps every hit, "
+        "flagged in the passes_min_pident column."
+    ),
+)
+def main(sample_id: str, config_path: Path, hits_path: Path | None, min_pident: float) -> None:
     project_root = Path(__file__).resolve().parent.parent
     biosurfdb_db = project_root / "data" / "biosurfdb"
     checkm2_db = project_root / "data" / "checkm2_db"
@@ -575,7 +650,11 @@ def main(sample_id: str, config_path: Path, hits_path: Path | None) -> None:
             logger.error(f"Missing BioSurfDB files in {biosurfdb_db}: {', '.join(missing)}")
             sys.exit(1)
         generate_biosurfdb_report(
-            sample_id, hits_path, biosurfdb_db, output_dir / "biosurfdb" / "report"
+            sample_id,
+            hits_path,
+            biosurfdb_db,
+            output_dir / "biosurfdb" / "report",
+            min_pident=min_pident,
         )
         return
 
@@ -623,6 +702,7 @@ def main(sample_id: str, config_path: Path, hits_path: Path | None) -> None:
         output_dir / "biosurfdb" / f"{sample_id}_hits.tsv",
         biosurfdb_db,
         output_dir / "biosurfdb" / "report",
+        min_pident=min_pident,
     )
 
 
